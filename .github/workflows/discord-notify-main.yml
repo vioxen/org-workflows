@@ -1,0 +1,127 @@
+name: Discord Notify on Main Push (reusable)
+
+# Reusable workflow that posts a Discord embed when commits land on main.
+#
+# Caller stub (drop into any vioxen repo as `.github/workflows/discord-notify-main.yml`):
+#
+#   name: Notify Discord on push to main
+#   on:
+#     push:
+#       branches: [main]
+#   jobs:
+#     notify:
+#       uses: vioxen/org-workflows/.github/workflows/discord-notify-main.yml@main
+#       secrets: inherit
+#
+# Required secret in the caller repo (or org-level):
+#   DISCORD_MAIN_PUSH_WEBHOOK — Discord webhook URL
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: "Runner label (override per-repo via vars.RUNNER if needed)"
+        type: string
+        required: false
+        default: "self-hosted"
+    secrets:
+      DISCORD_MAIN_PUSH_WEBHOOK:
+        description: "Discord webhook URL (incoming)"
+        required: true
+
+jobs:
+  notify:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      # The org's self-hosted runners (both ARC pool and host-installed)
+      # ship a minimal toolchain — jq is not preinstalled. Fetch a pinned
+      # binary to $RUNNER_TEMP and prepend to $GITHUB_PATH. SHA256 comes
+      # from the official sha256sum.txt published with jq 1.7.1.
+      - name: Install jq
+        env:
+          JQ_URL: https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
+          JQ_SHA256: 5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5
+        run: |
+          curl -sSL --fail "$JQ_URL" -o "$RUNNER_TEMP/jq"
+          echo "$JQ_SHA256  $RUNNER_TEMP/jq" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/jq"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Notify Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_MAIN_PUSH_WEBHOOK }}
+          # Pass GitHub event data through env vars (NOT direct ${{ ... }}
+          # interpolation into the script body) — otherwise commit messages
+          # containing quotes, backticks, dollar signs, or backslashes break
+          # shell parsing. See:
+          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          REPO: ${{ github.repository }}
+          # Fallback chain: linked GH user -> Git author name -> 'unknown'.
+          # author.username is empty for web-UI edits, bots, or unlinked
+          # accounts; Discord rejects empty fields[].value with HTTP 400.
+          AUTHOR: ${{ github.event.head_commit.author.username || github.event.head_commit.author.name || 'unknown' }}
+          URL: ${{ github.event.head_commit.url }}
+        run: |
+          # Subject extraction:
+          #   1. Strip CRLF (Windows-style endings carry stray \r into Discord embed)
+          #   2. Take first line only
+          #   3. Strip Markdown link syntax [text](url) — prevents phishing-link
+          #      injection from a malicious commit subject (Discord renders
+          #      embed descriptions as Markdown)
+          # Length capping happens inside jq (.[0:250]) — jq slices UTF-8 by
+          # codepoint, unlike `cut -c` which is byte-based and would split
+          # multi-byte characters (e.g. Cyrillic at position 250) and produce
+          # invalid UTF-8 that Discord rejects with HTTP 400.
+          COMMIT_SUBJECT=$(printf '%s' "$COMMIT_MSG" \
+            | tr -d '\r' \
+            | head -n 1 \
+            | sed -E 's/\[([^]]*)\]\([^)]*\)/\1/g')
+
+          # Build JSON payload with jq — handles all escaping (quotes,
+          # backticks, newlines, unicode) safely.
+          # description: cap at 250 codepoints inside jq (multibyte-safe),
+          #   then wrap in **bold** for Discord embed.
+          # allowed_mentions: {parse: []} — prevents commit subjects like
+          #   "@everyone please review" from triggering server-wide pings.
+          # url field is omitted when empty (some push event variants — e.g.
+          #   tag-backed pushes — leave head_commit.url blank, and Discord
+          #   rejects "url":"" with HTTP 400).
+          PAYLOAD=$(jq -n \
+            --arg title "Push to main in $REPO" \
+            --arg subject "$COMMIT_SUBJECT" \
+            --arg url "$URL" \
+            --arg author "$AUTHOR" \
+            '{
+              embeds: [
+                ({
+                  title: $title,
+                  description: ("**" + ($subject[0:250]) + "**"),
+                  color: 5763719,
+                  fields: [
+                    { name: "Author", value: $author, inline: true },
+                    { name: "Branch", value: "main", inline: true }
+                  ]
+                } + (if $url != "" then {url: $url} else {} end))
+              ],
+              allowed_mentions: { parse: [] }
+            }')
+
+          # POST and capture HTTP status separately from response body, then
+          # fail the job on >=400 while still printing Discord's error body.
+          # We can't use --fail-with-body here: it was added in curl 7.76
+          # (March 2021) and our self-hosted runners ship a curl that doesn't
+          # recognize it. -w '%{http_code}' / -o <file> is the portable
+          # equivalent and works on every curl since 7.0. Surfaces rate-limit
+          # 429, bad payload 400, revoked webhook 401 as CI failures instead
+          # of silently dropping notifications.
+          RESP_BODY="$RUNNER_TEMP/discord-resp.txt"
+          HTTP_CODE=$(curl -sS -o "$RESP_BODY" -w '%{http_code}' \
+            -X POST "$DISCORD_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Discord webhook returned HTTP $HTTP_CODE"
+            cat "$RESP_BODY"
+            exit 1
+          fi

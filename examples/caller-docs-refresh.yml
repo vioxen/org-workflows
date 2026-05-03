@@ -1,0 +1,31 @@
+# Drop this file into a vioxen repo as `.github/workflows/docs-refresh.yml`.
+#
+# Required secret: ANTHROPIC_API_KEY (repo-level or org-level)
+name: Docs Refresh
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [dev, main]
+    paths-ignore:
+      - "README.md"
+      - "CLAUDE.md"
+      - ".claude/CLAUDE.md"
+      - "docs/**"
+      - ".claude/rules/**"
+      - ".github/**"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "refresh | bootstrap"
+        type: choice
+        options: [refresh, bootstrap]
+        default: refresh
+
+jobs:
+  refresh:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    uses: vioxen/org-workflows/.github/workflows/docs-refresh.yml@main
+    with:
+      mode: ${{ inputs.mode || 'refresh' }}
+    secrets: inherit

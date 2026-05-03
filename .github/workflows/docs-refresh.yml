@@ -1,0 +1,318 @@
+name: Docs Refresh (reusable)
+
+# Auto-refreshes README.md and CLAUDE.md against the current code.
+#
+# Modes:
+#   refresh   — update existing docs where they have drifted (Sonnet, auto-merge to dev allowed)
+#   bootstrap — generate docs from scratch for repos that have none (Opus, draft-only, never auto-merge)
+#
+# Auto-merge policy:
+#   - Refresh PRs to `dev`  → auto-merge if scope guard + size cap + AI review pass
+#   - Refresh PRs to `main` → always draft (per merge-target rule, dev→main is human-controlled)
+#   - Bootstrap PRs (any branch) → always draft
+#
+# Caller stub (drop into any vioxen repo as `.github/workflows/docs-refresh.yml`):
+#
+#   name: Docs Refresh
+#   on:
+#     pull_request:
+#       types: [closed]
+#       branches: [dev, main]
+#       paths-ignore:
+#         - "README.md"
+#         - "CLAUDE.md"
+#         - ".claude/CLAUDE.md"
+#         - "docs/**"
+#         - ".claude/rules/**"
+#         - ".github/**"
+#     workflow_dispatch:
+#       inputs:
+#         mode:
+#           description: "refresh | bootstrap"
+#           type: choice
+#           options: [refresh, bootstrap]
+#           default: refresh
+#   jobs:
+#     refresh:
+#       if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+#       uses: vioxen/org-workflows/.github/workflows/docs-refresh.yml@main
+#       with:
+#         mode: ${{ inputs.mode || 'refresh' }}
+#       secrets: inherit
+#
+# Required secret in the caller repo (or org-level):
+#   ANTHROPIC_API_KEY — Anthropic API key for Claude
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "refresh | bootstrap"
+        type: string
+        required: false
+        default: refresh
+      runs-on:
+        description: "Runner label (defaults to arc-runner-set)"
+        type: string
+        required: false
+        default: "arc-runner-set"
+      org_workflows_ref:
+        description: "Ref of vioxen/org-workflows to use for shared scripts/prompts"
+        type: string
+        required: false
+        default: "main"
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: "Anthropic API key for Claude"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+# Coalesce rapid merges: if a new push lands while a refresh is running,
+# cancel the in-flight one and start fresh on the latest HEAD. We never
+# care about intermediate states.
+concurrency:
+  group: docs-refresh-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ${{ inputs.runs-on }}
+    env:
+      MODE: ${{ inputs.mode }}
+      BRANCH: docs-refresh/${{ github.run_id }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      # Checks out the calling repo into $GITHUB_WORKSPACE (default).
+      # claude-code-action@v1 operates on $GITHUB_WORKSPACE, so the caller
+      # MUST stay at the workspace root — no `path:` indirection.
+      - name: Checkout calling repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Fetch shared scripts + prompts to $RUNNER_TEMP (OUTSIDE $GITHUB_WORKSPACE)
+      # so they don't show up in `git diff` or `git add -A` against the caller repo.
+      - name: Fetch org-workflows shared assets
+        env:
+          ORG_WF_REF: ${{ inputs.org_workflows_ref }}
+        run: |
+          git clone --depth=1 --branch="$ORG_WF_REF" \
+            https://github.com/vioxen/org-workflows.git "$RUNNER_TEMP/org-workflows"
+          echo "ORG_WF_DIR=$RUNNER_TEMP/org-workflows" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pre-scan repo surface (deterministic, no LLM)
+        run: |
+          python3 "$ORG_WF_DIR/scripts/context-scanner.py" > /tmp/repo-context.json
+          echo "Scan summary:"
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/repo-context.json'))
+          print(f'  package_files: {len(d.get(\"package_files\", []))}')
+          print(f'  http_routes:   {len(d.get(\"http_routes\", []))}')
+          print(f'  env_vars:      {len(d.get(\"env_vars_referenced\", []))}')
+          print(f'  ports:         {len(d.get(\"ports_referenced\", []))}')
+          print(f'  vue_pages:     {len(d.get(\"vue_pages\", []))}')
+          print(f'  react_routes:  {len(d.get(\"react_routes\", []))}')
+          print(f'  proto_files:   {len(d.get(\"proto_files\", []))}')
+          print(f'  docker_svc:    {len(d.get(\"docker_services\", []))}')
+          "
+
+      - name: Compute drift report (deterministic, no LLM)
+        if: env.MODE == 'refresh'
+        run: |
+          REPO_CONTEXT_PATH=/tmp/repo-context.json \
+          DRIFT_REPORT_PATH=/tmp/drift-report.json \
+          python3 "$ORG_WF_DIR/scripts/drift-detector.py"
+          if [ -f /tmp/drift-report.json ]; then
+            python3 -c "
+          import json
+          d = json.load(open('/tmp/drift-report.json'))
+          stats = d.get('stats', {})
+          print(f'Drift items: {stats.get(\"total\", 0)} total ({stats.get(\"high\", 0)} high, {stats.get(\"medium\", 0)} medium)')
+          for it in d.get('drift_items', [])[:20]:
+              print(f'  [{it[\"severity\"]:6}] {it[\"kind\"]:20} {it[\"value\"]}')
+          "
+          fi
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "vioxen-docs-bot"
+          git config user.email "docs-bot@users.noreply.github.com"
+
+      - name: Create working branch
+        run: git switch -c "$BRANCH"
+
+      # `claude-code-action@v1` only accepts an inline `prompt` input — no
+      # `prompt_file` support. Read the file into a step output first.
+      - name: Load refresher prompt
+        id: load_prompt
+        run: |
+          delim="EOF_$(date +%s%N)"
+          {
+            printf 'prompt<<%s\n' "$delim"
+            cat "$ORG_WF_DIR/prompts/docs-${MODE}.md"
+            printf '\n%s\n' "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude (${{ inputs.mode }})
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Pass the workflow's GITHUB_TOKEN to bypass the "Claude Code GitHub
+          # App not installed" check. permissions: block above grants the
+          # contents:write + pull-requests:write needed.
+          # Side benefit: commits are attributed to github-actions[bot], not
+          # @claude[bot] — aligns with the no-AI-authorship rule (rule 05).
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: ${{ steps.load_prompt.outputs.prompt }}
+          claude_args: |
+            --model ${{ inputs.mode == 'bootstrap' && 'claude-opus-4-7' || 'claude-sonnet-4-6' }}
+            --allowedTools Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(find:*)
+            --max-turns 60
+
+      - name: Verify scope (only docs files touched)
+        id: scope
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            echo "No drift detected; nothing to commit."
+            exit 0
+          fi
+          changed=$(git diff --name-only)
+          echo "Changed files:"
+          echo "$changed"
+          # Allow only README.md, CLAUDE.md, .claude/CLAUDE.md, docs/**, .claude/rules/**
+          if echo "$changed" | grep -vE '^(README\.md|CLAUDE\.md|\.claude/CLAUDE\.md|docs/.*|\.claude/rules/.*)$' | grep -q .; then
+            echo "::error::Out-of-scope files modified — aborting auto-merge:"
+            echo "$changed" | grep -vE '^(README\.md|CLAUDE\.md|\.claude/CLAUDE\.md|docs/.*|\.claude/rules/.*)$'
+            echo "scope_violation=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          # Diff size cap: 500 lines added
+          added=$(git diff --numstat | awk '{s+=$1} END {print s+0}')
+          removed=$(git diff --numstat | awk '{s+=$2} END {print s+0}')
+          echo "Lines: +$added -$removed"
+          echo "lines_added=$added" >> "$GITHUB_OUTPUT"
+          echo "lines_removed=$removed" >> "$GITHUB_OUTPUT"
+          if [ "$added" -gt 500 ]; then
+            echo "::warning::Diff exceeds 500 added lines — auto-merge disabled, opening as draft."
+            echo "size_exceeded=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit & push
+        if: steps.scope.outputs.no_changes != 'true'
+        run: |
+          # Use `git add -u` (tracked-only). org-workflows is in $RUNNER_TEMP
+          # so it can't pollute the workspace, but stay defensive against any
+          # other untracked artifacts the LLM tools might leave behind.
+          git add -u
+          git commit -m "docs: ${MODE} README + CLAUDE.md against current code"
+          git push -u origin "$BRANCH"
+
+      - name: Load reviewer prompt
+        id: load_reviewer_prompt
+        if: steps.scope.outputs.no_changes != 'true' && inputs.mode == 'refresh'
+        run: |
+          delim="EOF_$(date +%s%N)"
+          {
+            printf 'prompt<<%s\n' "$delim"
+            cat "$ORG_WF_DIR/prompts/docs-reviewer.md"
+            printf '\n%s\n' "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: AI review of diff
+        id: review
+        if: steps.scope.outputs.no_changes != 'true' && inputs.mode == 'refresh'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: ${{ steps.load_reviewer_prompt.outputs.prompt }}
+          claude_args: |
+            --model claude-sonnet-4-6
+            --allowedTools Read,Glob,Grep,Bash(git diff:*),Bash(git log:*)
+            --max-turns 30
+
+      - name: Parse review verdict
+        id: verdict
+        if: steps.scope.outputs.no_changes != 'true' && inputs.mode == 'refresh'
+        run: |
+          if [ ! -f /tmp/docs-review-verdict.json ]; then
+            echo "::warning::Reviewer did not produce a verdict; defaulting to draft."
+            echo "verdict=manual" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          v=$(jq -r '.verdict // "manual"' /tmp/docs-review-verdict.json)
+          echo "verdict=$v" >> "$GITHUB_OUTPUT"
+          echo "Reviewer verdict: $v"
+          jq . /tmp/docs-review-verdict.json
+
+      # ARC runners ship without the gh CLI. Install it user-locally (no sudo).
+      - name: Install gh CLI
+        if: steps.scope.outputs.no_changes != 'true'
+        run: |
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+          GH_VERSION=2.59.0
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+            | tar xz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/gh" --version
+
+      - name: Open PR(s)
+        if: steps.scope.outputs.no_changes != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DRAFT=""
+          AUTO_MERGE_DEV="false"
+          if [ "$MODE" = "bootstrap" ]; then
+            DRAFT="--draft"
+          elif [ "${{ steps.scope.outputs.size_exceeded }}" = "true" ]; then
+            DRAFT="--draft"
+          elif [ "${{ steps.verdict.outputs.verdict }}" != "pass" ]; then
+            DRAFT="--draft"
+          else
+            AUTO_MERGE_DEV="true"
+          fi
+
+          BODY="$ORG_WF_DIR/prompts/pr-body.md"
+          [ -f "$BODY" ] || BODY="-"
+
+          create_pr() {
+            local base="$1"
+            local enable_automerge="$2"
+            if ! git ls-remote --exit-code --heads origin "$base" >/dev/null 2>&1; then
+              echo "Branch '$base' missing on origin; skipping."
+              return 0
+            fi
+            local title="docs: ${MODE} README + CLAUDE.md (auto)"
+            local url
+            if [ "$BODY" = "-" ]; then
+              url=$(gh pr create --base "$base" --head "$BRANCH" --title "$title" --body "Auto-generated by vioxen/org-workflows docs-refresh.yml" $DRAFT)
+            else
+              url=$(gh pr create --base "$base" --head "$BRANCH" --title "$title" --body-file "$BODY" $DRAFT)
+            fi
+            echo "PR ($base): $url"
+            if [ "$enable_automerge" = "true" ]; then
+              gh pr merge "$url" --auto --squash --delete-branch || echo "::warning::Could not enable auto-merge (branch protection may not require checks)"
+            fi
+          }
+
+          # Auto-merge ONLY to dev. main is always human-promoted.
+          create_pr dev "$AUTO_MERGE_DEV"
+          create_pr main "false"

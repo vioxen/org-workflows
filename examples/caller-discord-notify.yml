@@ -1,0 +1,13 @@
+# Drop this file into a vioxen repo as `.github/workflows/discord-notify-main.yml`.
+#
+# Required secret: DISCORD_MAIN_PUSH_WEBHOOK (repo-level or org-level)
+name: Notify Discord on push to main
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify:
+    uses: vioxen/org-workflows/.github/workflows/discord-notify-main.yml@main
+    secrets: inherit
