@@ -41,7 +41,7 @@ name: Docs Refresh (reusable)
 #       secrets: inherit
 #
 # Required secret in the caller repo (or org-level):
-#   ANTHROPIC_API_KEY — Anthropic API key for Claude
+#   ANTHROPIC_API_KEY_CI — Anthropic API key for Claude
 
 on:
   workflow_call:
@@ -62,7 +62,7 @@ on:
         required: false
         default: "main"
     secrets:
-      ANTHROPIC_API_KEY:
+      ANTHROPIC_API_KEY_CI:
         description: "Anthropic API key for Claude"
         required: true
 
@@ -166,7 +166,7 @@ jobs:
       - name: Run Claude (${{ inputs.mode }})
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY_CI }}
           # Pass the workflow's GITHUB_TOKEN to bypass the "Claude Code GitHub
           # App not installed" check. permissions: block above grants the
           # contents:write + pull-requests:write needed.
@@ -235,7 +235,7 @@ jobs:
         if: steps.scope.outputs.no_changes != 'true' && inputs.mode == 'refresh'
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY_CI }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: ${{ steps.load_reviewer_prompt.outputs.prompt }}
           claude_args: |
