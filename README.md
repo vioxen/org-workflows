@@ -15,7 +15,7 @@ current code, opens PRs back to both branches. Auto-merges to `dev` when an AI
 reviewer signs off; PRs to `main` are always opened as drafts (human-promoted).
 
 - **Trigger** (in caller): `pull_request: { types: [closed], branches: [dev, main] }`
-- **Required secret**: `ANTHROPIC_API_KEY`
+- **Required secret**: `ANTHROPIC_API_KEY_CI`
 - **Shared assets**: `scripts/context-scanner.py`, `scripts/drift-detector.py`,
   `prompts/docs-refresh.md`, `prompts/docs-bootstrap.md`, `prompts/docs-reviewer.md`,
   `prompts/pr-body.md` — all checked out into `$RUNNER_TEMP/org-workflows` at
