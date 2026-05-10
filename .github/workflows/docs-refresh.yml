@@ -65,6 +65,9 @@ on:
       ANTHROPIC_API_KEY_CI:
         description: "Anthropic API key for Claude"
         required: true
+      QUANTA_PIPELINE_TOKEN:
+        description: "Org PAT (admin) for pushes to branches with required-status-check protection. Optional — falls back to GITHUB_TOKEN where dev/main is unprotected."
+        required: false
 
 permissions:
   contents: write
@@ -95,6 +98,11 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.base.ref || github.ref_name }}
+          # Prefer QUANTA_PIPELINE_TOKEN (admin, bypasses non_admins-enforced
+          # branch protection on dev/main). Falls back to GITHUB_TOKEN where
+          # the secret isn't available — the push step will then succeed only
+          # on unprotected branches.
+          token: ${{ secrets.QUANTA_PIPELINE_TOKEN || secrets.GITHUB_TOKEN }}
 
       # Fetch shared scripts + prompts to $RUNNER_TEMP (OUTSIDE $GITHUB_WORKSPACE)
       # so they don't show up in `git diff` or `git add -A` against the caller repo.
