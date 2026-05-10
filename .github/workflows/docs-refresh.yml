@@ -3,13 +3,13 @@ name: Docs Refresh (reusable)
 # Auto-refreshes README.md and CLAUDE.md against the current code.
 #
 # Modes:
-#   refresh   — update existing docs where they have drifted (Sonnet, auto-merge to dev allowed)
-#   bootstrap — generate docs from scratch for repos that have none (Opus, draft-only, never auto-merge)
+#   refresh   — update existing docs where they have drifted (Sonnet)
+#   bootstrap — generate docs from scratch for repos that have none (Opus)
 #
-# Auto-merge policy:
-#   - Refresh PRs to `dev`  → auto-merge if scope guard + size cap + AI review pass
-#   - Refresh PRs to `main` → always draft (per merge-target rule, dev→main is human-controlled)
-#   - Bootstrap PRs (any branch) → always draft
+# Behavior: pushes the doc updates directly to the trigger branch
+# (the PR's base ref, or the dispatched ref). No PRs, no reviewer,
+# no scope/size gates. The bot needs push permission on dev/main —
+# either no branch protection, or a bypass via GITHUB_TOKEN.
 #
 # Caller stub (drop into any vioxen repo as `.github/workflows/docs-refresh.yml`):
 #
@@ -68,7 +68,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
   id-token: write
 
 # Coalesce rapid merges: if a new push lands while a refresh is running,
@@ -83,16 +82,19 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     env:
       MODE: ${{ inputs.mode }}
-      BRANCH: docs-refresh/${{ github.run_id }}
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      # Trigger branch: PR base ref for pull_request events, dispatched ref otherwise.
+      TARGET_BRANCH: ${{ github.event.pull_request.base.ref || github.ref_name }}
     steps:
       # Checks out the calling repo into $GITHUB_WORKSPACE (default).
       # claude-code-action@v1 operates on $GITHUB_WORKSPACE, so the caller
       # MUST stay at the workspace root — no `path:` indirection.
+      # We check out the target branch tip explicitly so commits land on
+      # the actual branch and not a detached merge ref.
       - name: Checkout calling repo
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.ref || github.ref_name }}
 
       # Fetch shared scripts + prompts to $RUNNER_TEMP (OUTSIDE $GITHUB_WORKSPACE)
       # so they don't show up in `git diff` or `git add -A` against the caller repo.
@@ -148,9 +150,6 @@ jobs:
           git config user.name  "vioxen-docs-bot"
           git config user.email "docs-bot@users.noreply.github.com"
 
-      - name: Create working branch
-        run: git switch -c "$BRANCH"
-
       # `claude-code-action@v1` only accepts an inline `prompt` input — no
       # `prompt_file` support. Read the file into a step output first.
       - name: Load refresher prompt
@@ -168,8 +167,8 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY_CI }}
           # Pass the workflow's GITHUB_TOKEN to bypass the "Claude Code GitHub
-          # App not installed" check. permissions: block above grants the
-          # contents:write + pull-requests:write needed.
+          # App not installed" check. permissions: contents:write above is
+          # what the bot actually needs (PRs are no longer created).
           # Side benefit: commits are attributed to github-actions[bot], not
           # @claude[bot] — aligns with the no-AI-authorship rule (rule 05).
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -179,140 +178,29 @@ jobs:
             --allowedTools Read,Edit,Write,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git status:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(find:*)
             --max-turns 60
 
-      - name: Verify scope (only docs files touched)
-        id: scope
+      - name: Commit & push directly to ${{ env.TARGET_BRANCH }}
         run: |
           set -euo pipefail
           if git diff --quiet; then
-            echo "no_changes=true" >> "$GITHUB_OUTPUT"
             echo "No drift detected; nothing to commit."
             exit 0
           fi
-          changed=$(git diff --name-only)
-          echo "Changed files:"
-          echo "$changed"
-          # Allow only README.md, CLAUDE.md, .claude/CLAUDE.md, docs/**, .claude/rules/**
-          if echo "$changed" | grep -vE '^(README\.md|CLAUDE\.md|\.claude/CLAUDE\.md|docs/.*|\.claude/rules/.*)$' | grep -q .; then
-            echo "::error::Out-of-scope files modified — aborting auto-merge:"
-            echo "$changed" | grep -vE '^(README\.md|CLAUDE\.md|\.claude/CLAUDE\.md|docs/.*|\.claude/rules/.*)$'
-            echo "scope_violation=true" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          # Diff size cap: 500 lines added
-          added=$(git diff --numstat | awk '{s+=$1} END {print s+0}')
-          removed=$(git diff --numstat | awk '{s+=$2} END {print s+0}')
-          echo "Lines: +$added -$removed"
-          echo "lines_added=$added" >> "$GITHUB_OUTPUT"
-          echo "lines_removed=$removed" >> "$GITHUB_OUTPUT"
-          if [ "$added" -gt 500 ]; then
-            echo "::warning::Diff exceeds 500 added lines — auto-merge disabled, opening as draft."
-            echo "size_exceeded=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Commit & push
-        if: steps.scope.outputs.no_changes != 'true'
-        run: |
-          # Use `git add -u` (tracked-only). org-workflows is in $RUNNER_TEMP
+          # Use `git add -u` (tracked-only). org-workflows lives in $RUNNER_TEMP
           # so it can't pollute the workspace, but stay defensive against any
           # other untracked artifacts the LLM tools might leave behind.
           git add -u
           git commit -m "docs: ${MODE} README + CLAUDE.md against current code"
-          git push -u origin "$BRANCH"
 
-      - name: Load reviewer prompt
-        id: load_reviewer_prompt
-        if: steps.scope.outputs.no_changes != 'true' && inputs.mode == 'refresh'
-        run: |
-          delim="EOF_$(date +%s%N)"
-          {
-            printf 'prompt<<%s\n' "$delim"
-            cat "$ORG_WF_DIR/prompts/docs-reviewer.md"
-            printf '\n%s\n' "$delim"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: AI review of diff
-        id: review
-        if: steps.scope.outputs.no_changes != 'true' && inputs.mode == 'refresh'
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY_CI }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          prompt: ${{ steps.load_reviewer_prompt.outputs.prompt }}
-          claude_args: |
-            --model claude-sonnet-4-6
-            --allowedTools Read,Glob,Grep,Bash(git diff:*),Bash(git log:*)
-            --max-turns 30
-
-      - name: Parse review verdict
-        id: verdict
-        if: steps.scope.outputs.no_changes != 'true' && inputs.mode == 'refresh'
-        run: |
-          if [ ! -f /tmp/docs-review-verdict.json ]; then
-            echo "::warning::Reviewer did not produce a verdict; defaulting to draft."
-            echo "verdict=manual" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          v=$(jq -r '.verdict // "manual"' /tmp/docs-review-verdict.json)
-          echo "verdict=$v" >> "$GITHUB_OUTPUT"
-          echo "Reviewer verdict: $v"
-          jq . /tmp/docs-review-verdict.json
-
-      # ARC runners ship without the gh CLI. Install it user-locally (no sudo).
-      - name: Install gh CLI
-        if: steps.scope.outputs.no_changes != 'true'
-        run: |
-          if command -v gh >/dev/null 2>&1; then
-            gh --version
-            exit 0
-          fi
-          GH_VERSION=2.59.0
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
-            | tar xz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/gh" --version
-
-      - name: Open PR(s)
-        if: steps.scope.outputs.no_changes != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          DRAFT=""
-          AUTO_MERGE_DEV="false"
-          if [ "$MODE" = "bootstrap" ]; then
-            DRAFT="--draft"
-          elif [ "${{ steps.scope.outputs.size_exceeded }}" = "true" ]; then
-            DRAFT="--draft"
-          elif [ "${{ steps.verdict.outputs.verdict }}" != "pass" ]; then
-            DRAFT="--draft"
-          else
-            AUTO_MERGE_DEV="true"
-          fi
-
-          BODY="$ORG_WF_DIR/prompts/pr-body.md"
-          [ -f "$BODY" ] || BODY="-"
-
-          create_pr() {
-            local base="$1"
-            local enable_automerge="$2"
-            if ! git ls-remote --exit-code --heads origin "$base" >/dev/null 2>&1; then
-              echo "Branch '$base' missing on origin; skipping."
-              return 0
+          # Race handling: if another run pushed while we were working,
+          # rebase onto the latest target branch and try again. One retry.
+          for attempt in 1 2; do
+            if git push origin "HEAD:${TARGET_BRANCH}"; then
+              echo "Pushed on attempt $attempt."
+              exit 0
             fi
-            local title="docs: ${MODE} README + CLAUDE.md (auto)"
-            local url
-            if [ "$BODY" = "-" ]; then
-              url=$(gh pr create --base "$base" --head "$BRANCH" --title "$title" --body "Auto-generated by vioxen/org-workflows docs-refresh.yml" $DRAFT)
-            else
-              url=$(gh pr create --base "$base" --head "$BRANCH" --title "$title" --body-file "$BODY" $DRAFT)
-            fi
-            echo "PR ($base): $url"
-            if [ "$enable_automerge" = "true" ]; then
-              gh pr merge "$url" --auto --squash --delete-branch || echo "::warning::Could not enable auto-merge (branch protection may not require checks)"
-            fi
-          }
-
-          # Auto-merge ONLY to dev. main is always human-promoted.
-          create_pr dev "$AUTO_MERGE_DEV"
-          create_pr main "false"
+            echo "Push rejected (attempt $attempt); fetching + rebasing onto origin/${TARGET_BRANCH}…"
+            git fetch origin "$TARGET_BRANCH"
+            git rebase "origin/${TARGET_BRANCH}"
+          done
+          echo "::error::Push to ${TARGET_BRANCH} failed after rebase retry."
+          exit 1
