@@ -11,15 +11,19 @@ and prompts live here.
 ### `docs-refresh.yml` — auto-refresh README + CLAUDE.md
 
 Runs Claude after every merge to `dev` or `main`, regenerates docs against the
-current code, opens PRs back to both branches. Auto-merges to `dev` when an AI
-reviewer signs off; PRs to `main` are always opened as drafts (human-promoted).
+current code, and pushes the updated `README.md` / `CLAUDE.md` directly to the
+trigger branch. No PRs, no reviewer, no scope/size gates — the bot needs push
+permission on `dev`/`main` (admin PAT via `QUANTA_PIPELINE_TOKEN`, or no branch
+protection on the target branch).
 
 - **Trigger** (in caller): `pull_request: { types: [closed], branches: [dev, main] }`
 - **Required secret**: `ANTHROPIC_API_KEY_CI`
+- **Optional secret**: `QUANTA_PIPELINE_TOKEN` (admin PAT to bypass non-admin
+  branch protection on `dev`/`main`)
 - **Shared assets**: `scripts/context-scanner.py`, `scripts/drift-detector.py`,
-  `prompts/docs-refresh.md`, `prompts/docs-bootstrap.md`, `prompts/docs-reviewer.md`,
-  `prompts/pr-body.md` — all checked out into `$RUNNER_TEMP/org-workflows` at
-  job start so they live in one place and update without per-repo PRs.
+  `prompts/docs-refresh.md`, `prompts/docs-bootstrap.md` — checked out into
+  `$RUNNER_TEMP/org-workflows` at job start so they live in one place and
+  update without per-repo PRs.
 
 See `examples/caller-docs-refresh.yml` for the full caller stub.
 
