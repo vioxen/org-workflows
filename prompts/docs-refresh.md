@@ -19,7 +19,9 @@ You are auditing this repository's existing developer docs against the current c
 - `.claude/CLAUDE.md` (if it exists)
 - `docs/**/*.md` (if such files exist)
 
-**You MUST NOT** modify any other file. The CI scope guard will reject the PR if you do.
+**You MUST NOT** modify any other file. The workflow stages tracked changes
+only (`git add -u`), so untracked files outside the allow-list won't be
+committed — but don't write them in the first place.
 
 ## Hard rule: address every high-severity drift item
 
@@ -38,21 +40,6 @@ For each drift item:
 - **`high` severity** — fix the docs. The new env var must be documented, the stale command must be removed, the wrong port must be corrected. No exceptions.
 - **`medium` severity** — fix unless there's a real reason not to (e.g., the missing dir is intentionally undocumented because it's internal-only).
 - **`low` severity** — same.
-
-When you finish, write a resolution log to `/tmp/drift-resolution.json`:
-```json
-{
-  "resolved": [
-    { "id": "DRIFT_001", "action": "added env var to README.md table" },
-    { "id": "DRIFT_002", "action": "removed stale command from CLAUDE.md" }
-  ],
-  "skipped": [
-    { "id": "DRIFT_023", "reason": "internal-only directory, intentionally undocumented" }
-  ]
-}
-```
-
-The auto-reviewer will check this file. If you skip a `high` item without a strong reason, the PR will be rejected.
 
 ## Audit workflow
 
@@ -99,17 +86,8 @@ The auto-reviewer will check this file. If you skip a `high` item without a stro
 
 ## When you're done
 
-1. Write `/tmp/drift-resolution.json` listing every drift item and how you resolved/skipped it.
-2. Stop.
-
-The CI will:
-1. Verify only allow-listed files were touched.
-2. Cap diff at 500 added lines (else PR opens as draft).
-3. Run a separate AI review pass (`docs-reviewer.md`) which:
-   - Reads `/tmp/drift-report.json` AND `/tmp/drift-resolution.json`
-   - Verifies every `high` item was actually resolved in the diff
-   - Spot-checks accuracy of new claims
-   - Writes verdict to `/tmp/docs-review-verdict.json`
-4. If the reviewer says `pass`, auto-merge to `dev`.
+Stop. The workflow will stage tracked changes (`git add -u`), commit, and push
+directly to the trigger branch. There is no PR, no second-pass reviewer, and
+no auto-merge gate — your edits land on `dev`/`main` as soon as you exit.
 
 Be thorough on accuracy, conservative on style. The drift report tells you what to focus on — focus.
