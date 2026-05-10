@@ -193,22 +193,50 @@ jobs:
             echo "No drift detected; nothing to commit."
             exit 0
           fi
-          # Use `git add -u` (tracked-only). org-workflows lives in $RUNNER_TEMP
-          # so it can't pollute the workspace, but stay defensive against any
-          # other untracked artifacts the LLM tools might leave behind.
-          git add -u
-          git commit -m "docs: ${MODE} README + CLAUDE.md against current code"
 
-          # Race handling: if another run pushed while we were working,
-          # rebase onto the latest target branch and try again. One retry.
-          for attempt in 1 2; do
+          # Snapshot Claude's changes BEFORE any commit/push. This lets us
+          # recover from any push failure (race, force-push, shallow rebase
+          # add/add conflicts) by hard-resetting to the latest origin/<branch>
+          # and re-applying the snapshot — which never conflicts with itself.
+          SNAP=/tmp/docs-snapshot
+          rm -rf "$SNAP" && mkdir -p "$SNAP/files"
+          git diff --name-only > "$SNAP/files.list"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            mkdir -p "$SNAP/files/$(dirname "$f")"
+            cp "$f" "$SNAP/files/$f"
+          done < "$SNAP/files.list"
+          echo "Snapshot $(wc -l < "$SNAP/files.list") changed file(s)."
+
+          for attempt in 1 2 3; do
+            # On retries, sync to latest origin and re-apply snapshot.
+            if [ "$attempt" -gt 1 ]; then
+              echo "Re-applying snapshot onto fresh origin/${TARGET_BRANCH}…"
+              git fetch origin "$TARGET_BRANCH"
+              git reset --hard "origin/${TARGET_BRANCH}"
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                mkdir -p "$(dirname "$f")"
+                cp "$SNAP/files/$f" "$f"
+              done < "$SNAP/files.list"
+              if git diff --quiet; then
+                echo "Snapshot already in origin/${TARGET_BRANCH}; nothing to push."
+                exit 0
+              fi
+            fi
+
+            git add -u
+            git commit -m "docs: ${MODE} README + CLAUDE.md against current code" || {
+              # Possible no-op commit if snapshot matched origin exactly.
+              echo "Nothing to commit on attempt $attempt."
+              exit 0
+            }
+
             if git push origin "HEAD:${TARGET_BRANCH}"; then
               echo "Pushed on attempt $attempt."
               exit 0
             fi
-            echo "Push rejected (attempt $attempt); fetching + rebasing onto origin/${TARGET_BRANCH}…"
-            git fetch origin "$TARGET_BRANCH"
-            git rebase "origin/${TARGET_BRANCH}"
+            echo "Push rejected (attempt $attempt)."
           done
-          echo "::error::Push to ${TARGET_BRANCH} failed after rebase retry."
+          echo "::error::Push to ${TARGET_BRANCH} failed after 3 attempts."
           exit 1
