@@ -1,0 +1,149 @@
+# Shared gitleaks configuration for the vioxen organization.
+#
+# Consumed by `.github/workflows/gitleaks.yml` (reusable). Callers get this
+# file fetched to $RUNNER_TEMP at job start — same shared-asset pattern as
+# docs-refresh.yml — so allowlist tuning lands here in ONE PR instead of ~30.
+#
+# A repo that needs a genuinely local exception commits its own `.gitleaks.toml`
+# and points the caller at it via the `config_path` input. Prefer adding the
+# entry here if the class is org-wide.
+#
+# RULE FOR NEW ENTRIES (from QUANTATECH-450 guardrails): every allowlist entry
+# cites the QUANTATECH-446 false-positive class it neutralizes. No blanket
+# suppression, no undocumented regex. If you cannot name the class, the finding
+# is probably real — rotate it instead.
+
+[extend]
+# Inherit the full upstream gitleaks ruleset (~170 rules). Without this the
+# config REPLACES the defaults and the gate silently detects nothing — the
+# worst possible failure mode for a security control.
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Custom rules — gaps in the upstream ruleset that QUANTATECH-446 proved real
+# ---------------------------------------------------------------------------
+
+[[rules]]
+# Upstream gitleaks 8.30.1 has NO rule for credentials embedded in a connection
+# URI. Verified empirically while building this gate: the default ruleset (and
+# generic-api-key) walk straight past
+#   DATABASE_URL=postgres://app:S3cretPwd123!@db.internal:5432/quanta
+# The 446 sweep found a real Postgres password in history, so this is not a
+# hypothetical class -- without this rule the gate would not have stopped one of
+# the leaks that motivated it. Redis/AMQP/Mongo take the same shape.
+id = "vioxen-uri-embedded-credential"
+description = "Credential embedded in a connection URI (postgres/redis/mongodb/amqp/http)"
+# The userinfo username is `*` not `+` on purpose: Redis and AMQP URIs are
+# routinely written with an empty username -- redis://:hunter2@host:6379 --
+# and a `+` quantifier walks straight past them (caught in testing).
+regex = '''(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|https?|ftp)://[^\s:/?#@]*:([^\s:@/?#]{6,})@'''
+# Point --redact at the password group only, so CI logs show the host and
+# scheme (needed to locate the leak) while the credential stays masked.
+secretGroup = 1
+keywords = ["postgres", "postgresql", "mysql", "mongodb", "redis", "amqp", "://"]
+
+[[rules.allowlists]]
+description = "Placeholder credentials in docs, .env.example and runbooks."
+regexTarget = "match"
+regexes = [
+  '''(?i)://[^\s:@/]+:(changeme|password|passwd|pass|secret|<[^>]+>|\$\{[^}]+\}|x{4,}|\*{4,})@''',
+]
+
+# ---------------------------------------------------------------------------
+# Allowlists — QUANTATECH-446 false-positive classes
+# ---------------------------------------------------------------------------
+
+[[allowlists]]
+description = """
+446 class: secret-sanitizer source and its synthetic detection vectors.
+These files contain deliberately-shaped fake credentials as test fixtures --
+they are the sanitizer's own regression corpus. The dedicated sanitizer repos
+(quanta-secrets-core, quanta-secrets-mcp, claude-quanta-secrets-plugin) are
+excluded from the gate entirely; this path rule covers the copies that live
+INSIDE in-scope repos, notably forge-*/security.rs in governors-daemons.
+"""
+paths = [
+  '''(^|/)security\.rs$''',
+  '''(^|/)sanitize\.rs$''',
+  '''(^|/)quanta-secrets-(core|mcp)/''',
+  # This gate's own test corpus -- same class, found by dogfooding the scanner
+  # against this repo (9 findings, all synthetic). TRADEOFF: a real credential
+  # pasted into the self-test would be invisible to the gate. The script carries
+  # a matching warning; keep its vectors synthetic.
+  '''(^|/)scripts/gitleaks-selftest\.sh$''',
+]
+
+[[allowlists]]
+description = """
+446 class: gitleaks' own report artifacts. `_meta.json` files emitted by prior
+sweeps embed the findings they described, so scanning them re-reports every
+historical leak as a fresh one -- an infinite self-referential loop.
+"""
+paths = [
+  '''(^|/)_meta\.json$''',
+  '''(^|/)gitleaks-report\.json$''',
+]
+
+[[allowlists]]
+description = """
+446 class: AIMLAPI model identifiers. Values like AIMLAPI_MODEL=... are model
+NAMES (high-entropy vendor slugs), not credentials. Scoped to the assignment
+form so a real AIMLAPI key sitting in the same file is still caught.
+NOTE: AIMLAPI is being removed from the stack (QUANTATECH-440) -- delete this
+entry once that lands.
+"""
+regexTarget = "line"
+regexes = [
+  '''AIMLAPI_MODEL\s*[=:]\s*["']?[\w./-]+["']?''',
+]
+
+[[allowlists]]
+description = """
+446 class: WebSocket/Centrifugo handshake nonces. Per-connection random values
+in protocol fixtures and captured handshakes -- high entropy, zero secrecy
+value, never reusable. Scoped to the nonce/challenge key names.
+"""
+regexTarget = "line"
+regexes = [
+  '''"(nonce|challenge|client_nonce|server_nonce)"\s*:\s*"[A-Za-z0-9+/=_-]{16,}"''',
+]
+
+[[allowlists]]
+description = """
+446 class: test fixtures, mocks and E2E seed data. Credential-shaped strings
+committed as inputs to the test suites (Jest/Vitest/Playwright/cargo).
+Deliberately NARROW -- matches fixture/mock/seed directories, not every path
+containing the substring "test", so a leak in src/ is never masked by a
+neighbouring test file.
+"""
+paths = [
+  '''(^|/)__(mocks|fixtures)__/''',
+  '''(^|/)(fixtures|__snapshots__)/''',
+  '''(^|/)test(s)?/(fixtures|seed|data)/''',
+  '''(^|/)e2e/(fixtures|seed)/''',
+]
+
+[[allowlists]]
+description = """
+Lockfiles. npm/cargo integrity hashes (sha512-..., checksum = "...") are
+content digests, not credentials, and they are pure entropy by construction.
+Scoped to the integrity/checksum keys so a real token pasted into a lockfile
+registry URL is still caught.
+"""
+regexTarget = "line"
+regexes = [
+  '''"integrity"\s*:\s*"sha(256|512)-[A-Za-z0-9+/=]+"''',
+  '''^\s*checksum\s*=\s*"[a-f0-9]{64}"''',
+]
+
+[[allowlists]]
+description = """
+Documented vendor placeholders that appear in our own docs and .env.example
+files. EXAMPLE-suffixed AWS keys are already handled upstream; this covers the
+generic <your-...-here> / xxxx / CHANGEME placeholder shapes we use in runbooks.
+"""
+regexTarget = "line"
+regexes = [
+  '''(?i)(changeme|your[-_]?(api[-_]?)?(key|token|secret)[-_]?here|<[a-z0-9_-]*(key|token|secret|password)[a-z0-9_-]*>)''',
+  '''(?i)(x{8,}|0{16,}|1234567890abcdef)''',
+]

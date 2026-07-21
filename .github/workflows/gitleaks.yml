@@ -1,0 +1,244 @@
+name: Gitleaks Secret Scan (reusable)
+
+# Reusable workflow that blocks secrets from reaching a repo's default branch.
+#
+# Caller stub (drop into any vioxen repo as `.github/workflows/gitleaks.yml`):
+#
+#   name: Gitleaks
+#   on:
+#     pull_request:
+#     schedule:
+#       - cron: "17 4 * * 1"
+#   jobs:
+#     scan:
+#       uses: vioxen/org-workflows/.github/workflows/gitleaks.yml@main
+#
+# No secrets required. See examples/caller-gitleaks.yml for the full stub.
+#
+# ---------------------------------------------------------------------------
+# Why a pinned binary instead of gitleaks/gitleaks-action@v2
+# ---------------------------------------------------------------------------
+# gitleaks-action v2 requires a paid GITLEAKS_LICENSE for repos owned by an
+# ORGANIZATION (it is free only for individual accounts). vioxen is an org, so
+# the action would either fail or bill us. The gitleaks CLI itself is MIT and
+# free with no such restriction, so we fetch a pinned, checksum-verified
+# release binary and call it directly. Same scanner, no licence surface.
+#
+# ---------------------------------------------------------------------------
+# Scope: this gate stops NEW leaks. It does not clean history.
+# ---------------------------------------------------------------------------
+# PR mode scans only the commits the PR adds (merge-base..head). A secret
+# already sitting in history does NOT fail unrelated PRs -- that would make the
+# gate un-adoptable on repos QUANTATECH-446 flagged. Historical leaks are
+# handled by 446 (rotate + leave). Full-history scanning is opt-in via
+# `full_history`, and is expected to be RED on 446-affected repos until their
+# rotations land and a baseline is captured.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: "Runner label"
+        type: string
+        required: false
+        default: "arc-runner-set"
+      org_workflows_ref:
+        description: "Ref of vioxen/org-workflows to use for the shared .gitleaks.toml"
+        type: string
+        required: false
+        default: "main"
+      gitleaks_version:
+        description: "Pinned gitleaks release (must match the checksum table below)"
+        type: string
+        required: false
+        default: "8.30.1"
+      config_path:
+        description: >-
+          Path to a gitleaks config INSIDE the calling repo. Empty (default) uses
+          the shared org allowlist from vioxen/org-workflows/.gitleaks.toml.
+          Only set this when a repo needs a genuinely local exception.
+        type: string
+        required: false
+        default: ""
+      full_history:
+        description: >-
+          Scan the entire git history instead of just the PR range. Expected to
+          fail on QUANTATECH-446-affected repos until rotations + baseline land.
+          Intended for the scheduled run once a repo is clean.
+        type: boolean
+        required: false
+        default: false
+      fail_on_leak:
+        description: >-
+          Fail the check when a leak is found. Set false for a report-only
+          soak on a repo being onboarded; MUST be true for the gate to mean
+          anything, so treat false as temporary.
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitleaks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      # fetch-depth 0: PR mode needs the merge-base between the PR head and the
+      # base branch, which a shallow clone does not contain. A shallow fetch
+      # here silently degrades into "scan nothing" rather than erroring.
+      - name: Checkout calling repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Shared allowlist lives OUTSIDE $GITHUB_WORKSPACE so it is never picked
+      # up as a file of the repo under scan (and never appears in a diff).
+      # Same pattern as docs-refresh.yml.
+      - name: Fetch shared gitleaks config
+        if: inputs.config_path == ''
+        env:
+          ORG_WF_REF: ${{ inputs.org_workflows_ref }}
+        run: |
+          git clone --depth=1 --branch="$ORG_WF_REF" \
+            https://github.com/vioxen/org-workflows.git "$RUNNER_TEMP/org-workflows"
+          echo "GITLEAKS_CONFIG=$RUNNER_TEMP/org-workflows/.gitleaks.toml" >> "$GITHUB_ENV"
+
+      - name: Resolve repo-local config
+        if: inputs.config_path != ''
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          if [ ! -f "$CONFIG_PATH" ]; then
+            echo "::error::config_path '$CONFIG_PATH' not found in the calling repo"
+            exit 1
+          fi
+          echo "GITLEAKS_CONFIG=$GITHUB_WORKSPACE/$CONFIG_PATH" >> "$GITHUB_ENV"
+
+      # Pinned + checksum-verified. Checksums are the official ones published
+      # in gitleaks_<version>_checksums.txt. Bumping `gitleaks_version` WITHOUT
+      # adding the matching checksums here fails closed (unknown version ->
+      # explicit error), never "download whatever and trust it".
+      - name: Install gitleaks
+        env:
+          GL_VERSION: ${{ inputs.gitleaks_version }}
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64|amd64) GL_ARCH=x64 ;;
+            aarch64|arm64) GL_ARCH=arm64 ;;
+            *) echo "::error::unsupported runner architecture $(uname -m)"; exit 1 ;;
+          esac
+
+          # version|arch -> sha256 of the release tarball
+          case "${GL_VERSION}|${GL_ARCH}" in
+            "8.30.1|x64")
+              GL_SHA=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;;
+            "8.30.1|arm64")
+              GL_SHA=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080 ;;
+            *)
+              echo "::error::no pinned checksum for gitleaks ${GL_VERSION} on ${GL_ARCH}."
+              echo "Add it from https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/gitleaks_${GL_VERSION}_checksums.txt"
+              exit 1 ;;
+          esac
+
+          GL_TGZ="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -sSL --fail \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/gitleaks_${GL_VERSION}_linux_${GL_ARCH}.tar.gz" \
+            -o "$GL_TGZ"
+          echo "${GL_SHA}  ${GL_TGZ}" | sha256sum -c -
+          tar -xzf "$GL_TGZ" -C "$RUNNER_TEMP" gitleaks
+          chmod +x "$RUNNER_TEMP/gitleaks"
+          "$RUNNER_TEMP/gitleaks" version
+
+      # Determine what to scan. PR events scan only what the PR introduces;
+      # everything else (push, schedule, manual) scans full history.
+      - name: Resolve scan range
+        env:
+          FULL_HISTORY: ${{ inputs.full_history }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$FULL_HISTORY" = "true" ]; then
+            echo "SCAN_LOG_OPTS=" >> "$GITHUB_ENV"
+            echo "SCAN_DESC=full history" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # Use the true merge-base, not github.event.pull_request.base.sha:
+          # that field is the base tip recorded when the event fired, so on a
+          # busy base branch it drifts and drags unrelated commits into the
+          # scan (noisy failures on other people's leaks).
+          git fetch --no-tags --quiet origin "$BASE_REF"
+          MERGE_BASE=$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")
+          echo "Scanning $MERGE_BASE..$HEAD_SHA"
+          echo "SCAN_LOG_OPTS=--no-merges $MERGE_BASE..$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "SCAN_DESC=PR commits ($BASE_REF...${HEAD_SHA:0:7})" >> "$GITHUB_ENV"
+
+      - name: Run gitleaks
+        id: scan
+        env:
+          FAIL_ON_LEAK: ${{ inputs.fail_on_leak }}
+        run: |
+          set -uo pipefail
+          REPORT="$RUNNER_TEMP/gitleaks-report.csv"
+
+          # --redact: never emit a raw secret into CI logs or the report.
+          #   Verified: it scrubs the report file too, not just stdout.
+          # --exit-code 2: distinguish "leaks found" (2) from "gitleaks itself
+          #   broke" (1). Without this both are 1 and a crashed scanner is
+          #   indistinguishable from a clean repo -- a silent-failure hole.
+          set +e
+          "$RUNNER_TEMP/gitleaks" git "$GITHUB_WORKSPACE" \
+            ${SCAN_LOG_OPTS:+--log-opts="$SCAN_LOG_OPTS"} \
+            --config "$GITLEAKS_CONFIG" \
+            --redact \
+            --no-banner \
+            --verbose \
+            --exit-code 2 \
+            --report-format csv \
+            --report-path "$REPORT"
+          GL_EXIT=$?
+          set -e
+
+          if [ "$GL_EXIT" -eq 1 ]; then
+            echo "::error::gitleaks failed to run (exit 1). This is a scanner/config error, NOT a clean result."
+            exit 1
+          fi
+
+          {
+            echo "## Gitleaks — ${SCAN_DESC:-full history}"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$GL_EXIT" -eq 0 ]; then
+            echo "No leaks found." >> "$GITHUB_STEP_SUMMARY"
+            echo "gitleaks: clean"
+            exit 0
+          fi
+
+          # Findings table. Columns 1,3,7 = RuleID, File, StartLine. The Secret
+          # and Match columns are deliberately NOT surfaced: even redacted they
+          # add nothing, and one bad --redact flag away they would leak.
+          {
+            echo "| Rule | File | Line |"
+            echo "|------|------|------|"
+            awk -F',' 'NR>1 && NF>6 { printf "| %s | %s | %s |\n", $1, $3, $7 }' "$REPORT"
+            echo
+            echo "Secret values are redacted. Rotate the credential first, then remove it from the diff."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAIL_ON_LEAK" = "true" ]; then
+            echo "::error::gitleaks found secrets in ${SCAN_DESC:-full history}. Rotate the credential, then remove it from the diff."
+            exit 1
+          fi
+
+          echo "::warning::gitleaks found secrets, but fail_on_leak=false (report-only soak)."

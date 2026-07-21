@@ -1,0 +1,50 @@
+name: Gitleaks Self-Test
+
+# Guards the shared allowlist against the two ways a secret gate rots:
+#   1. the ruleset stops firing (config replaces defaults instead of extending)
+#   2. an allowlist entry is widened until it suppresses real findings
+# Both leave the check permanently GREEN while leaking, so this asserts in
+# BOTH directions -- planted secrets must fail, known false positives must not.
+#
+# Runs on PRs that touch the gate itself. Anyone widening the allowlist has to
+# get past this first.
+
+on:
+  pull_request:
+    paths:
+      - ".gitleaks.toml"
+      - ".github/workflows/gitleaks.yml"
+      - ".github/workflows/gitleaks-selftest.yml"
+      - "scripts/gitleaks-selftest.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: arc-runner-set
+    env:
+      # Keep in sync with the default in .github/workflows/gitleaks.yml.
+      GL_VERSION: "8.30.1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64|amd64) GL_ARCH=x64;   GL_SHA=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;;
+            aarch64|arm64) GL_ARCH=arm64; GL_SHA=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080 ;;
+            *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+          esac
+          GL_TGZ="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -sSL --fail \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/gitleaks_${GL_VERSION}_linux_${GL_ARCH}.tar.gz" \
+            -o "$GL_TGZ"
+          echo "${GL_SHA}  ${GL_TGZ}" | sha256sum -c -
+          tar -xzf "$GL_TGZ" -C "$RUNNER_TEMP" gitleaks
+          chmod +x "$RUNNER_TEMP/gitleaks"
+
+      - name: Run self-test
+        run: ./scripts/gitleaks-selftest.sh "$RUNNER_TEMP/gitleaks"

@@ -38,6 +38,32 @@ truncation, surfaces non-200 responses as job failures.
 
 See `examples/caller-discord-notify.yml` for the full caller stub.
 
+### `gitleaks.yml` — secret scanning gate
+
+Blocks credentials from reaching a repo's default branch. On a PR it scans only
+the commits the PR adds (merge-base..head), so a repo with known historical
+leaks can adopt the gate without every unrelated PR turning red.
+
+- **Trigger** (in caller): `pull_request` + a weekly `schedule`
+- **Required secret**: none
+- **Shared asset**: `.gitleaks.toml` — the org allowlist, fetched to
+  `$RUNNER_TEMP` at job start, so tuning it is one PR here instead of one per repo.
+- **Key inputs**: `fail_on_leak` (report-only soak), `full_history` (off by
+  default — expected to be red on QUANTATECH-446-affected repos until their
+  rotations land), `config_path` (repo-local override).
+
+Uses a pinned, checksum-verified gitleaks release binary rather than
+`gitleaks/gitleaks-action`, which requires a **paid licence for
+organization-owned repos**. Same scanner, no licence surface.
+
+`scripts/gitleaks-selftest.sh` asserts the config in both directions — planted
+secrets must fail, the known false-positive classes must stay clean — and runs
+in CI (`gitleaks-selftest.yml`) on any PR touching the gate. An allowlist that
+is only ever tested against false positives eventually suppresses everything
+and goes permanently green while leaking.
+
+See `examples/caller-gitleaks.yml` for the full caller stub.
+
 ## Adding a new reusable workflow
 
 1. Add `.github/workflows/<name>.yml` with `on: workflow_call:` and explicit
