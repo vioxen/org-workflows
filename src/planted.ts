@@ -1,0 +1,1 @@
+export const AWS_KEY = "AKIA4SLTQ2WPZRXNVJHD";

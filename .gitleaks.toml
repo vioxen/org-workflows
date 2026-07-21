@@ -147,3 +147,5 @@ regexes = [
   '''(?i)(changeme|your[-_]?(api[-_]?)?(key|token|secret)[-_]?here|<[a-z0-9_-]*(key|token|secret|password)[a-z0-9_-]*>)''',
   '''(?i)(x{8,}|0{16,}|1234567890abcdef)''',
 ]
+
+# (temporary marker so the selftest paths filter fires on this test PR)
