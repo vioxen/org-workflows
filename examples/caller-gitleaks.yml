@@ -1,0 +1,34 @@
+# Drop this file into a vioxen repo as `.github/workflows/gitleaks.yml`.
+#
+# No secrets required — the gitleaks CLI is fetched as a pinned, checksum-
+# verified release binary (we deliberately do NOT use gitleaks-action, which
+# needs a paid licence for organization-owned repos).
+#
+# What it does:
+#   - on every PR: scans only the commits the PR adds. A secret in the diff
+#     fails the check. Pre-existing history is NOT scanned, so onboarding a
+#     repo with known historical leaks (QUANTATECH-446) does not wedge it.
+#   - weekly: same PR-shaped scan of the default branch. Flip `full_history`
+#     to true once the repo's history is actually clean.
+name: Gitleaks
+
+on:
+  pull_request:
+  schedule:
+    # Weekly, off-peak. Stagger the minute per repo so ~30 repos do not all
+    # hit the runner pool in the same minute.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    uses: vioxen/org-workflows/.github/workflows/gitleaks.yml@main
+    # Defaults are correct for most repos. Overrides worth knowing:
+    #
+    # with:
+    #   fail_on_leak: false   # report-only soak while onboarding a noisy repo
+    #   full_history: true    # only once history is clean + rotations landed
+    #   config_path: .gitleaks.toml   # repo-local exception instead of the shared allowlist
